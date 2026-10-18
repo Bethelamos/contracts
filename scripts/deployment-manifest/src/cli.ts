@@ -8,11 +8,13 @@ import {
   readRecord,
   readManifest,
   serialize,
+  coverageErrors,
   validateDeployment,
   validateManifest,
   type Chain,
   type Contract,
   type Deployment,
+  type Undeployed,
 } from './manifest.js';
 import { MANIFEST_PATH, REPO_ROOT, recordPath, repoPath } from './paths.js';
 import { SourceSession, candidateCommits, dirtyFiles, resolveSourceCommit } from './provenance.js';
@@ -55,6 +57,9 @@ const USAGE = `Usage: tsx src/cli.ts <command>
     stellar  --contract name=CContractId --wasm name=path/to.wasm [--deployer G...]
     solana   --program name=ProgramId
     ckb      --script name=0xTxHash:index:hashType[:external]
+    evm      --undeployed Name=reason   mark a supported contract as not deployed on
+                                        this network (repeatable). Recording a contract
+                                        removes it from the undeployed list.
     common   --recorded-by deploy-script|chain-query  --source-commit <sha|HEAD>
              --version <semver> | --version name=<semver>   (repeatable)
              --public-rpc <https-url>   stored as rpcUrl for \`verify\`. --rpc is never
@@ -249,6 +254,7 @@ async function record(chain: Chain, argv: string[]): Promise<void> {
       wasm: { type: 'string', multiple: true },
       abi: { type: 'string', multiple: true },
       deployer: { type: 'string', multiple: true },
+      undeployed: { type: 'string', multiple: true },
       'recorded-by': { type: 'string', default: 'chain-query' },
       'source-commit': { type: 'string' },
       version: { type: 'string', multiple: true },
@@ -340,6 +346,16 @@ async function record(chain: Chain, argv: string[]): Promise<void> {
   }
   if (unproven.length) fail(unproven.map((u) => `source commit does not reproduce: ${u}`));
 
+  const recordedNames = new Set(recorded.map((c) => c.name));
+  const undeployed = new Map<string, Undeployed>(
+    (existing?.undeployed ?? []).filter((u) => !recordedNames.has(u.name)).map((u) => [u.name, u]),
+  );
+  for (const [name, reason] of pairs(values.undeployed, '--undeployed')) {
+    if (recordedNames.has(name))
+      throw new Error(`${name} cannot be both recorded and --undeployed`);
+    undeployed.set(name, { name, reason });
+  }
+
   const deployment: Deployment = {
     chain,
     network: values.network,
@@ -349,17 +365,25 @@ async function record(chain: Chain, argv: string[]): Promise<void> {
       : {}),
     recordedBy,
     contracts: [...contracts.values()],
+    ...(undeployed.size ? { undeployed: [...undeployed.values()] } : {}),
   };
   const errors = validateDeployment(deployment);
+  if (!errors.length) errors.push(...coverageErrors(deployment));
   if (errors.length) fail(errors);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, serialize(deployment));
-  console.log(`✓ ${path.relative(REPO_ROOT, file)}: ${recorded.map((c) => c.name).join(', ')}`);
+  console.log(
+    `✓ ${path.relative(REPO_ROOT, file)}: ${recorded.map((c) => c.name).join(', ') || 'no new contracts'}` +
+      (undeployed.size ? ` (undeployed: ${[...undeployed.keys()].join(', ')})` : ''),
+  );
   build();
 }
 
 async function verify(): Promise<void> {
   const manifest = readManifest();
+  // Every supported contract must have an explicit record before anything is read from a chain.
+  const invalid = validateManifest(manifest);
+  if (invalid.length) fail(invalid);
   const problems: string[] = [];
   for (const d of manifest.deployments) {
     if (!d.rpcUrl) {
