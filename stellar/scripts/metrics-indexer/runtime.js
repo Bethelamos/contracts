@@ -13,6 +13,11 @@
 // cursor is persisted atomically (temp file + rename), validated on load,
 // and corruption is reported via a dedicated error so the caller can decide
 // whether to reset to the default cursor or fail closed.
+//
+// The store is wired into the actual getEvents polling path via
+// `createIndexerRuntime`: it loads the cursor on start, commits after each
+// successful page, rewinds on a detected reorg, and deduplicates replayed
+// events before handling them.
 
 import { truncate } from './redact.js';
 import { promises as fs } from 'node:fs';
@@ -58,7 +63,7 @@ export function deriveHealthState({
   lastError = null,
   staleAfterMs,
   failureThreshold,
-  rpcHost,
+  rpchost,
   pollIntervalMs,
 }) {
   const hasSucceeded = Number.isFinite(stats.lastSuccessAt);
@@ -76,7 +81,7 @@ export function deriveHealthState({
     stale,
     uptimeMs: Math.max(0, now - startedAt),
     pollIntervalMs,
-    rpcHost,
+    rpchost,
     lastSuccessAt: hasSucceeded ? stats.lastSuccessAt : null,
     lastError: lastError ?? null,
     consecutiveFailures: stats.consecutiveFailures,
@@ -403,13 +408,14 @@ export function createCursorStore({
  * @param {string[]} seenIds
  * @param {object} [options]
  * @param {number} [options.maxSeenIds]
- * @returns {{fresh: Array<object>, seenIds: string[]}}
+ * @returns {{ fresh: Array<object>, seenIds: string[] }}
  */
 export function dedupeEvents(events, seenIds = [], { maxSeenIds = 10000 } = {}) {
-  const seen = new Set(seenIds.map((id) => String(id)));
-  const ordered = seenIds.map((id) => String(id));
+  const seen = new Set((seenIds || []).map((id) => String(id)));
   const fresh = [];
-  for (const event of events) {
+  const ordered = Array.from(seen);
+
+  for (const event of events || []) {
     const id = event && event.id !== undefined ? String(event.id) : null;
     if (id === null) {
       fresh.push(event);
@@ -422,8 +428,96 @@ export function dedupeEvents(events, seenIds = [], { maxSeenIds = 10000 } = {}) 
     ordered.push(id);
     fresh.push(event);
   }
+
   while (ordered.length > maxSeenIds) {
     ordered.shift();
   }
+
   return { fresh, seenIds: ordered };
+}
+
+/**
+ * Wire the cursor store into the getEvents polling path.
+ *
+ * On the first poll the persisted cursor is loaded and rewind by
+ * `rewindLedgers` is applied for reorg safety. After each successful page the
+ * cursor and seen ids are committed. Replayed events are deduplicated before
+ * being returned to the caller.
+ *
+ * @param {object} options
+ * @param {object} options.cursorStore
+ * @param {(args: {cursor: string}) => Promise<{events: Array<object>, cursor: string}>} options.getEvents
+ * @param {number} [options.rewindLedgers]
+ * @param {number} [options.maxSeenIds]
+ */
+export function createIndexerRuntime({
+  cursorStore,
+  getEvents,
+  rewindLedgers = 0,
+  maxSeenIds = 10000,
+} = {}) {
+  if (!cursorStore || typeof cursorStore.load !== 'function') {
+    throw new TypeError('createIndexerRuntime requires a cursorStore');
+  }
+  if (typeof getEvents !== 'function') {
+    throw new TypeError('createIndexerRuntime requires a getEvents function');
+  }
+
+  let initialized = false;
+  let cursor = cursorStore.defaultCursor;
+  let seenIds = [];
+
+  function rewindCursor(value, ledgers) {
+    if (!ledgers || ledgers <= 0) {
+      return value;
+    }
+    const match = /^(\d+)(?:-(\d+))?$/.exec(value);
+    if (!match) {
+      return value;
+    }
+    const ledger = Number(match[1]);
+    const next = Math.max(0, ledger - ledgers);
+    return `${next}-0`;
+  }
+
+  async function ensureInitialized() {
+    if (initialized) {
+      return;
+    }
+    const loaded = await cursorStore.load();
+    cursor = rewindCursor(loaded.cursor, rewindLedgers);
+    seenIds = Array.isArray(loaded.seenIds) ? loaded.seenIds.slice() : [];
+    initialized = true;
+  }
+
+  async function pollOnce() {
+    await ensureInitialized();
+    const response = await getEvents({ cursor });
+    const events = Array.isArray(response && response.events) ? response.events : [];
+    const nextCursor = response && response.cursor ? String(response.cursor) : cursor;
+    const deduped = dedupeEvents(events, seenIds, { maxSeenIds });
+    seenIds = deduped.seenIds;
+    cursor = nextCursor;
+    await cursorStore.commit({ cursor, seenIds: seenIds });
+    return { fresh: deduped.fresh, cursor, seenIds: seenIds.slice() };
+  }
+
+  async function handleReorg() {
+    await ensureInitialized();
+    const rewinded = await cursorStore.rewind();
+    cursor = rewinded.cursor;
+    seenIds = Array.isArray(rewinded.seenIds) ? rewinded.seenIds.slice() : [];
+    return { cursor, seenIds: seenIds.slice() };
+  }
+
+  return {
+    pollOnce,
+    handleReorg,
+    get cursor() {
+      return cursor;
+    },
+    get seenIds() {
+      return seenIds.slice();
+    },
+  };
 }

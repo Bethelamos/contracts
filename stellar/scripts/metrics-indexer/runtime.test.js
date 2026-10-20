@@ -180,7 +180,7 @@ describe('redaction and truncation', () => {
 
   it('bounds long strings', () => {
     const out = truncate('a'.repeat(1000), 100);
-    assert.ok(out.startsWith('a'.repeat(100)));
+    assert.ok(startsWith('a'.repeat(100)));
     assert.ok(out.length < 200);
   });
 
@@ -197,7 +197,7 @@ describe('cursor persistence', () => {
   let dir;
 
   beforeEach(async () => {
-    dir = await mkdtemp(join(tmpdir(), 'metrics-cursor-'));
+    dir = await mkdtemp(join(tmpdir(), 'metrics-cursor'));
   });
 
   afterEach(async () => {
@@ -226,7 +226,7 @@ describe('cursor persistence', () => {
     const filePath = join(dir, 'cursor.json');
     const store = createCursorStore({ filePath });
     await store.commit({ cursor: '100-0', seenIds: ['evt-1'] });
-    await store.commit({ cursor: '200-0', seenIds: ['evt-2'] });
+    await store.commit({ cursor: '200-0', seenIds: ['evt-1', 'evt-2'] });
 
     const rewinded = await store.rewind();
     assert.equal(rewinded.cursor, '100-0');
@@ -283,5 +283,99 @@ describe('dedupeEvents', () => {
     const result = dedupeEvents(events, [], { maxSeenIds: 3 });
     assert.equal(result.seenIds.length, 3);
     assert.deepEqual(result.seenIds, ['evt-7', 'evt-8', 'evt-9']);
+  });
+});
+
+describe('metrics indexer runtime integration', () => {
+  let dir;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'metrics-runtime-'));
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('loads the cursor, polls getEvents, commits, and deduplicates across restarts', async () => {
+    const filePath = join(dir, 'cursor.json');
+    const store = createCursorStore({ filePath });
+    const calls = [];
+
+    const runtime = createMetricsRuntime({
+      cursorStore: store,
+      getEvents: async ({ cursor }) => {
+        calls.push(cursor);
+        if (cursor === store.defaultCursor) {
+          return {
+            events: [
+              { id: 'evt-1', ledger: 100 },
+              { id: 'evt-2', ledger: 101 },
+            ],
+            cursor: '101-0',
+          };
+        }
+        return { events: [], cursor };
+      },
+    });
+
+    const first = await runtime.pollOnce();
+    assert.deepEqual(calls, [store.defaultCursor]);
+    assert.deepEqual(first.fresh.map((e) => e.id), ['evt-1', 'evt-2']);
+
+    const persisted = await createCursorStore({ filePath }).load();
+    assert.equal(persisted.cursor, '101-0');
+    assert.deepEqual(persisted.seenIds, ['evt-1', 'evt-2']);
+
+    // Restart: a fresh runtime must resume from the committed cursor and
+    // drop events already seen before the restart.
+    const restartCalls = [];
+    const restarted = createMetricsRuntime({
+      cursorStore: createCursorStore({ filePath }),
+      getEvents: async ({ cursor }) => {
+        restartCalls.push(cursor);
+        return {
+          events: [
+            { id: 'evt-2', ledger: 101 },
+            { id: 'evt-3', ledger: 102 },
+          ],
+          cursor: '102-0',
+        };
+      },
+    });
+
+    const second = await restarted.pollOnce();
+    assert.deepEqual(restartCalls, ['101-0']);
+    assert.deepEqual(second.fresh.map((e) => e.id), ['evt-3']);
+  });
+
+  it('rewinds to the last confirmed cursor on reorg and re-polls from there', async () => {
+    const filePath = join(dir, 'cursor.json');
+    const store = createCursorStore({ filePath });
+    await store.commit({ cursor: '100-0', seenIds: ['evt-1'] });
+    await store.commit({ cursor: '200-0', seenIds: ['evt-1', 'evt-2'] });
+
+    const calls = [];
+    const runtime = createMetricsRuntime({
+      cursorStore: createCursorStore({ filePath }),
+      getEvents: async ({ cursor }) => {
+        calls.push(cursor);
+        return {
+          events: [{ id: 'evt-2', ledger: 201 }],
+          cursor: '201-0',
+        };
+      },
+    });
+
+    const result = await runtime.pollOnce();
+    assert.deepEqual(calls, ['200-0']);
+    assert.deepEqual(result.fresh.map((e) => e.id), []);
+
+    const rewinded = await runtime.handleReorg({ cursor: '100-0' });
+    assert.equal(rewinded.cursor, '100-0');
+    assert.deepEqual(rewinded.seenIds, ['evt-1']);
+
+    const afterReorg = await runtime.pollOnce();
+    assert.deepEqual(afterReorg.fresh.map((e) => e.id), []);
   });
 });
