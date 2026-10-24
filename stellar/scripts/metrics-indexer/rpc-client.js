@@ -339,21 +339,21 @@ export function createRpcClient(options = {}) {
   const redactedUrl = options.redactedUrl ?? redactUrl(url);
 
   // Full-jitter backoff: uniform over [0, min(retryMaxMs, retryBaseMs * 2^attempt)].
-  function backoffMs(attempt) {
+  function backoffDelay(attempt) {
     const ceiling = Math.min(retryMaxMs, retryBaseMs * 2 ** attempt);
     return Math.floor(random() * ceiling);
   }
 
   return {
-    url,
     redactedUrl,
-    timeoutMs,
-    maxAttempts,
-    maxResponseBytes,
-    backoffMs,
+    backoffDelay,
+    parseEvents,
+    buildGetEventsParams,
+    validateEnvelope,
+    readTextCapped,
+    defaults: { timeoutMs, maxAttempts, maxResponseBytes },
+    fetchImpl,
     sleep,
     onRetry,
-    fetchImpl,
-    parseEvents,
   };
 }

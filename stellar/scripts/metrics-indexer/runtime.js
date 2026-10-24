@@ -63,8 +63,8 @@ export function deriveHealthState({
   rpcHost,
   pollIntervalMs,
 }) {
-  const hasSucceeded = Number.isFinite(stats.lastSuccessAt);
-  const stale = !hasSucceeded || now - stats.lastSuccessAt > staleAfterMs;
+  const hasSucceeded = typeof stats.lastSuccessAt === 'number' && Number.isFinite(stats.lastSuccessAt);
+  const stale = !hasSucceeded || now - stats.lastSuccessAt >= staleAfterMs;
 
   let status = 'healthy';
   if (stats.consecutiveFailures >= failureThreshold) {
@@ -233,6 +233,7 @@ export function createPoller({ intervalMs, run, now = () => Date.now(), sleep, o
     lastDurationMs: null,
     lastSuccessAt: null,
     lastErrorAt: null,
+    lastError: null,
   };
 
   let inFlight = false;
